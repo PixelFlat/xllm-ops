@@ -169,6 +169,9 @@ elif [[ "$SOC_VERSION" =~ ^(ascend)?910b ]]; then
         "mega_chunk_gdn"
         "laser_attention"
         "layer_norm_fwd"
+        "xllm_chunk_kda_fwd_prepare"
+        "pre_process_fwd_kernel_merged"
+        "merge_fwd_bwd_kernel"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
@@ -255,11 +258,12 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
     if [[ "${CANN_TOOLKIT_VERSION}" =~ ^([0-9]+)\.([0-9]+) ]]; then
         if [[ "${BASH_REMATCH[1]}" -ge 9 ]]; then
             CUSTOM_OPS_ARRAY+=("mega_chunk_gdn")
+            CUSTOM_OPS_ARRAY+=("xllm_chunk_kda_fwd_prepare" "pre_process_fwd_kernel_merged" "merge_fwd_bwd_kernel")
         else
-            log "skip mega_chunk_gdn for CANN version ${CANN_TOOLKIT_VERSION}"
+            log "skip mega_chunk_gdn and kda cp ops for CANN version ${CANN_TOOLKIT_VERSION}"
         fi
     else
-        log "skip mega_chunk_gdn because CANN version is unavailable"
+        log "skip mega_chunk_gdn and kda cp ops because CANN version is unavailable"
     fi
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend910_93"
@@ -332,6 +336,9 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "mega_chunk_gdn"
         "mega_gdn_prefill_op"
         "layer_norm_fwd"
+        "xllm_chunk_kda_fwd_prepare"
+        "pre_process_fwd_kernel_merged"
+        "merge_fwd_bwd_kernel"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend950"
