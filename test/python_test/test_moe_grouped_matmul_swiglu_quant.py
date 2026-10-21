@@ -148,3 +148,100 @@ def test_moe_grouped_matmul_swiglu_quant(counts, K, W):
         group_list.npu())
 
     _assert_quant_close(y_npu.cpu(), golden_y, scale_npu.cpu(), golden_scale)
+
+
+def _chunk_group_pairs(group_pairs: list[tuple[int, int]], start: int, stop: int) -> list[tuple[int, int]]:
+    """Intersect consecutive group spans with one chunk, preserving expert IDs."""
+    if any(expert < 0 or count < 0 for expert, count in group_pairs):
+        raise ValueError("Expert IDs and group counts must be nonnegative")
+    if start < 0 or stop < start or stop > sum(count for _, count in group_pairs):
+        raise ValueError("Chunk must be inside the concatenated group rows")
+    result = []
+    offset = 0
+    for expert, count in group_pairs:
+        end = offset + count
+        overlap = max(0, min(stop, end) - max(start, offset))
+        if overlap > 0:
+            result.append((expert, overlap))
+        offset = end
+    # Non-split kernels stop at a zero count. Omit empty intersections only
+    # in the reference; the full split call still exercises zero-count groups.
+    return result
+
+
+def test_chunk_group_pairs_preserves_experts_and_skips_empty_spans() -> None:
+    pairs = [(3, 0), (2, 4), (0, 0), (1, 5), (4, 0)]
+    assert _chunk_group_pairs(pairs, 0, 3) == [(2, 3)]
+    assert _chunk_group_pairs(pairs, 3, 7) == [(2, 1), (1, 3)]
+    assert _chunk_group_pairs(pairs, 7, 9) == [(1, 2)]
+    assert _chunk_group_pairs(pairs, 0, 9) == [(2, 4), (1, 5)]
+    assert _chunk_group_pairs(pairs, 4, 4) == []
+
+
+def _chunked_moe_quant_reference(
+    x: torch.Tensor,
+    weight_nz: torch.Tensor,
+    weight_scale: torch.Tensor,
+    x_scale: torch.Tensor,
+    group_pairs: list[tuple[int, int]],
+    chunk_rows: int = 4096,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Use the same public NPU operator below its workspace-split threshold."""
+    if not 0 < chunk_rows <= 4096:
+        raise ValueError("Reference chunks must contain at most 4096 rows")
+    rows = x.shape[0]
+    reference_y = torch.empty((rows, weight_scale.shape[1] // 2), dtype=torch.int8)
+    reference_scale = torch.empty((rows,), dtype=torch.float32)
+    for start in range(0, rows, chunk_rows):
+        stop = min(start + chunk_rows, rows)
+        pairs = _chunk_group_pairs(group_pairs, start, stop)
+        assert sum(count for _, count in pairs) == stop - start
+        chunk_groups = torch.tensor(pairs, dtype=torch.int64, device=x.device)
+        chunk_y, chunk_scale = custom_ops.moe_grouped_matmul_swiglu_quant_npu(
+            x[start:stop], weight_nz, weight_scale, x_scale[start:stop], chunk_groups
+        )
+        reference_y[start:stop].copy_(chunk_y.cpu())
+        reference_scale[start:stop].copy_(chunk_scale.cpu())
+    return reference_y, reference_scale
+
+
+@pytest.mark.parametrize(
+    "rows,routing",
+    [
+        (65536, "identity"),
+        (65537, "identity"),
+        (65536, "permuted"),
+        (65537, "permuted"),
+        (65537, "permuted_zeros"),
+    ],
+)
+def test_moe_grouped_matmul_swiglu_quant_workspace_split(rows: int, routing: str) -> None:
+    # K=128/full W=256 gives mLimit=32768 and selects workspace splitting
+    # only above 65536 rows. At least one expert spans a workspace window.
+    torch.manual_seed(20261015)
+    hidden_size, full_width = 128, 256
+    if routing == "identity":
+        pairs = [(0, 40000), (1, rows - 40000)]
+    elif routing == "permuted":
+        pairs = [(2, 15000), (0, 25000), (3, 10000), (1, rows - 50000)]
+    else:
+        assert routing == "permuted_zeros" and rows > 65536
+        pairs = [(2, 0), (0, 40000), (3, 0), (1, rows - 40000)]
+    experts = max(expert for expert, _ in pairs) + 1
+    x = torch.randint(-8, 8, (rows, hidden_size), dtype=torch.int8).npu()
+    weight = torch.randint(-8, 8, (experts, hidden_size, full_width), dtype=torch.int8)
+    weight_nz = weight_to_nz(weight).npu()
+    weight_scale = (torch.randn(experts, full_width) * 0.01).to(torch.float32).npu()
+    x_scale = (torch.rand(rows) * 0.5 + 0.75).to(torch.float32).npu()
+    groups = torch.tensor(pairs, dtype=torch.int64).npu()
+
+    actual_y, actual_scale = custom_ops.moe_grouped_matmul_swiglu_quant_npu(x, weight_nz, weight_scale, x_scale, groups)
+    reference_y, reference_scale = _chunked_moe_quant_reference(x, weight_nz, weight_scale, x_scale, pairs)
+    actual_y, actual_scale = actual_y.cpu(), actual_scale.cpu()
+    assert actual_y.dtype == reference_y.dtype == torch.int8
+    assert actual_scale.dtype == reference_scale.dtype == torch.float32
+    assert torch.isfinite(actual_scale).all()
+    assert torch.isfinite(reference_scale).all()
+    assert (actual_scale > 0).all()
+    assert (reference_scale > 0).all()
+    _assert_quant_close(actual_y, reference_y, actual_scale, reference_scale)
