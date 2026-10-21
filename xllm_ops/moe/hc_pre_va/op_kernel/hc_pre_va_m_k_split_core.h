@@ -651,10 +651,11 @@ class HcPreVaMembaseKSplitCorePart2 {
                          curRowFactor,
                          tilingData->hcMult,
                          tilingData->hcMult);
+        // Column sums retain the block-aligned stride from ReduceSumARAPerf.
         Adds(reduceLocal,
              reduceLocal,
              tilingData->hcEps,
-             curRowFactor * tilingData->hcMult);
+             curRowFactor * tilingData->hcMultAlign);
         PipeBarrier<PIPE_V>();
         DivABABrcInline(combFragLocal,
                         mixes02ReduceLocal,
@@ -686,7 +687,7 @@ class HcPreVaMembaseKSplitCorePart2 {
           Adds(reduceLocal,
                reduceLocal,
                tilingData->hcEps,
-               curRowFactor * tilingData->hcMult);
+               curRowFactor * tilingData->hcMultAlign);
           PipeBarrier<PIPE_V>();
           DivABABrcInline(combFragLocal,
                           combFragLocal,

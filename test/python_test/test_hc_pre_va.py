@@ -367,6 +367,84 @@ def test_hc_pre_va_multiline_and_tail_tiles(
             assert torch.equal(value, reference)
 
 
+@pytest.mark.parametrize("hidden_size", [128, HIDDEN_SIZE])
+@pytest.mark.parametrize("external_mix", [False, True])
+@pytest.mark.parametrize("base_mode", ["zero", "normal", "small"])
+@pytest.mark.parametrize("iterations", [1, 2, 4, 20])
+@torch.inference_mode()
+def test_hc_pre_va_identical_rows_match_single_token(
+    hidden_size: int, external_mix: bool, base_mode: str, iterations: int
+) -> None:
+    torch.manual_seed(101)
+    hidden = torch.randn(1, HC_MULT, hidden_size).to(torch.bfloat16).npu()
+    # Remove GEMM and RMS rounding from the coefficients under test.
+    fn = torch.zeros(MIX_HC, HC_MULT * hidden_size, device=hidden.device)
+    scale = torch.zeros(3, device=hidden.device)
+    base = torch.zeros(MIX_HC) if base_mode == "zero" else torch.randn(MIX_HC)
+    if base_mode == "small":
+        base *= 0.01
+    base = base.npu()
+    mix = torch.rand(1, HC_MULT, device=hidden.device) if external_mix else None
+    single = tuple(
+        value.cpu()
+        for value in custom_ops.hc_pre_va_npu(
+            hidden, fn, scale, base, mix, HC_MULT, iterations, NORM_EPS, HC_EPS
+        )
+    )
+    # Cover one-row calls, multi-row tiles, full tiles and partial final tiles.
+    # Small widths permit multi-row stage-2 tiles; 5120 covers the checkpoint.
+    for tokens in (1, 3, 33, 65, 127, 128, 129, 4097):
+        actual = custom_ops.hc_pre_va_npu(
+            hidden.repeat(tokens, 1, 1),
+            fn,
+            scale,
+            base,
+            mix.repeat(tokens, 1) if mix is not None else None,
+            HC_MULT,
+            iterations,
+            NORM_EPS,
+            HC_EPS,
+        )
+        for name, value, reference in zip(("y", "post", "comb", "pre"), actual, single):
+            assert torch.equal(value.cpu(), reference.expand_as(value)), (
+                f"{name} changes with row position or partition: "
+                f"tokens={tokens}, hidden={hidden_size}, iterations={iterations}"
+            )
+
+
+@pytest.mark.parametrize("hidden_size", [128, HIDDEN_SIZE])
+@pytest.mark.parametrize("external_mix", [False, True])
+@torch.inference_mode()
+def test_hc_pre_va_identical_coefficients_after_graph_input_update(
+    hidden_size: int, external_mix: bool
+) -> None:
+    torch.manual_seed(101)
+    tokens = 129
+    hidden = torch.randn(1, HC_MULT, hidden_size).to(torch.bfloat16).npu()
+    hidden = hidden.repeat(tokens, 1, 1)
+    fn = torch.zeros(MIX_HC, HC_MULT * hidden_size, device=hidden.device)
+    scale = torch.zeros(3, device=hidden.device)
+    base = torch.randn(MIX_HC, device=hidden.device)
+    mix = torch.rand(1, HC_MULT, device=hidden.device) if external_mix else None
+    mix = mix.repeat(tokens, 1) if mix is not None else None
+
+    def execute() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return custom_ops.hc_pre_va_npu(hidden, fn, scale, base, mix)
+
+    execute()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        captured = execute()
+    for factor in (1.0, 0.25):
+        base.mul_(factor)
+        graph.replay()
+        fresh = execute()
+        torch.npu.synchronize()
+        for value, reference in zip(captured, fresh):
+            assert torch.equal(value, reference)
+            assert torch.equal(value, value[:1].expand_as(value))
+
+
 @pytest.mark.parametrize(
     "invalid",
     [
