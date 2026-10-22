@@ -1,0 +1,1 @@
+add_modules_sources_aicpu(DEPENDENCIES smla_va)

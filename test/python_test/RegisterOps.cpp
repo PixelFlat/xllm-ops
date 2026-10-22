@@ -20,7 +20,6 @@ limitations under the License.
 
 #include "acl/acl_rt.h"
 #include "pytorch_npu_helper.hpp"
-#include "../../xllm_ops/moe/hc_pre_va/hc_pre_va_torch_adpt.h"
 
 void select_unshared_kv_impl_npu(
     const at::Tensor& beam_index,
@@ -2271,6 +2270,389 @@ at::Tensor mega_gdn_prefill_op(
   return out;
 }
 
+namespace xllm_ops_hc_pre_va {
+std::tuple<at::Tensor, at::Tensor, at::Tensor> construct_hc_pre_output_tensor(
+    const at::Tensor& x,
+    int64_t hc_mult) {
+  auto xDims = x.dim();
+  at::SmallVector<int64_t, 8> y_size;
+  at::SmallVector<int64_t, 8> post_size;
+  at::SmallVector<int64_t, 8> comb_frag_size;
+  if (xDims == 4) {
+    auto batch = x.size(0);
+    auto size = x.size(1);
+    auto d = x.size(3);
+    y_size = {batch, size, d};
+    post_size = {batch, size, hc_mult};
+    comb_frag_size = {batch, size, hc_mult, hc_mult};
+  } else if (xDims == 3) {
+    auto bs = x.size(0);
+    auto d = x.size(2);
+    y_size = {bs, d};
+    post_size = {bs, hc_mult};
+    comb_frag_size = {bs, hc_mult, hc_mult};
+  }
+
+  at::Tensor y = at::empty(y_size, x.options().dtype(at::kBFloat16));
+  at::Tensor post = at::empty(post_size, x.options().dtype(at::kFloat));
+  at::Tensor comb_frag =
+      at::empty(comb_frag_size, x.options().dtype(at::kFloat));
+
+  return std::tuple<at::Tensor, at::Tensor, at::Tensor>(y, post, comb_frag);
+}
+
+at::Tensor construct_hc_pre_pre_output_tensor(const at::Tensor& x,
+                                              int64_t hc_mult) {
+  at::SmallVector<int64_t, 8> pre_size;
+  if (x.dim() == 4) {
+    pre_size = {x.size(0), x.size(1), hc_mult};
+  } else if (x.dim() == 3) {
+    pre_size = {x.size(0), hc_mult};
+  }
+  return at::empty(pre_size, x.options().dtype(at::kFloat));
+}
+
+void check_hc_pre_shape_and_dtype(const at::Tensor& x,
+                                  const at::Tensor& hc_fn,
+                                  const at::Tensor& hc_scale,
+                                  const at::Tensor& hc_base,
+                                  const c10::optional<at::Tensor>& pre_mix,
+                                  int64_t hc_mult) {
+  constexpr int64_t HC_PRE_HC_LIMIT = 4;
+  constexpr int64_t HC_PRE_MIX_HC_LIMIT = 24;
+  constexpr int64_t HC_SCALE_SIZE = 3;
+  auto x_dims = x.dim();
+  TORCH_CHECK(x_dims == 3 || x_dims == 4,
+              "Input tensor x's dim num should be 3 or 4, actual ",
+              x_dims,
+              ".");
+  for (auto i = 0; i < x_dims; i++) {
+    TORCH_CHECK(x.size(i) > 0,
+                "Input tensor x's shape should be positive, but x.shape[",
+                i,
+                "] is ",
+                x.size(i),
+                ".");
+  }
+
+  auto hc = x_dims == 4 ? x.size(2) : x.size(1);
+  auto d = x_dims == 4 ? x.size(3) : x.size(2);
+  TORCH_CHECK(hc_mult == HC_PRE_HC_LIMIT,
+              "hc_mult only supports ",
+              HC_PRE_HC_LIMIT,
+              ", actual ",
+              hc_mult,
+              ".");
+  TORCH_CHECK(hc == HC_PRE_HC_LIMIT,
+              "The hc of x only supports ",
+              HC_PRE_HC_LIMIT,
+              ", actual ",
+              hc,
+              ".");
+  TORCH_CHECK(hc_fn.dim() == 2,
+              "Input tensor hc_fn's dim num should be 2, actual ",
+              hc_fn.dim(),
+              ".");
+  TORCH_CHECK(hc_fn.size(0) == HC_PRE_MIX_HC_LIMIT,
+              "The hc_fn.shape[0] only supports ",
+              HC_PRE_MIX_HC_LIMIT,
+              ", actual ",
+              hc_fn.size(0),
+              ".");
+  TORCH_CHECK(hc_fn.size(1) == hc * d,
+              "The hc_fn.shape[1] should be hc * d, actual hc_fn.shape[1] is ",
+              hc_fn.size(1),
+              ", hc is ",
+              hc,
+              ", d is ",
+              d,
+              ".");
+  TORCH_CHECK(hc_scale.dim() == 1,
+              "Input tensor hc_scale's dim num should be 1, actual ",
+              hc_scale.dim(),
+              ".");
+  TORCH_CHECK(hc_scale.size(0) == HC_SCALE_SIZE,
+              "Input tensor hc_scale's shape should be [",
+              HC_SCALE_SIZE,
+              "], actual [",
+              hc_scale.size(0),
+              "].");
+  TORCH_CHECK(hc_base.dim() == 1,
+              "Input tensor hc_base's dim num should be 1, actual ",
+              hc_base.dim(),
+              ".");
+  TORCH_CHECK(hc_base.size(0) == HC_PRE_MIX_HC_LIMIT,
+              "The hc_base.shape[0] only supports ",
+              HC_PRE_MIX_HC_LIMIT,
+              ", actual ",
+              hc_base.size(0),
+              ".");
+
+  TORCH_CHECK(x.dtype() == at::kBFloat16, "x's dtype should be BFLOAT16.");
+  TORCH_CHECK(hc_fn.dtype() == at::kFloat, "hc_fn's dtype should be FLOAT32.");
+  TORCH_CHECK(hc_scale.dtype() == at::kFloat,
+              "hc_scale's dtype should be FLOAT32.");
+  TORCH_CHECK(hc_base.dtype() == at::kFloat,
+              "hc_base's dtype should be FLOAT32.");
+  if (pre_mix.has_value() && pre_mix->defined()) {
+    TORCH_CHECK(pre_mix->dtype() == at::kFloat,
+                "pre_mix's dtype should be FLOAT32.");
+    TORCH_CHECK(pre_mix->dim() == x_dims - 1,
+                "pre_mix's dim num should be ",
+                x_dims - 1,
+                ", actual ",
+                pre_mix->dim(),
+                ".");
+    for (auto i = 0; i < x_dims - 1; i++) {
+      TORCH_CHECK(pre_mix->size(i) == x.size(i),
+                  "pre_mix.shape[",
+                  i,
+                  "] should equal x.shape[",
+                  i,
+                  "], actual ",
+                  pre_mix->size(i),
+                  " vs ",
+                  x.size(i),
+                  ".");
+    }
+  }
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> run_hc_pre_fusion(
+    const at::Tensor& x,
+    const at::Tensor& hc_fn,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    const c10::optional<at::Tensor>& pre_mix,
+    int64_t hc_mult,
+    int64_t hc_sinkhorn_iters,
+    double norm_eps,
+    double hc_eps) {
+  auto output_tensors = construct_hc_pre_output_tensor(x, hc_mult);
+  at::Tensor y = std::get<0>(output_tensors);
+  at::Tensor post = std::get<1>(output_tensors);
+  at::Tensor comb_frag = std::get<2>(output_tensors);
+  at::Tensor pre = construct_hc_pre_pre_output_tensor(x, hc_mult);
+  EXEC_NPU_CMD(aclnnHcPreVa,
+               x,
+               hc_fn,
+               hc_scale,
+               hc_base,
+               pre_mix,
+               hc_mult,
+               hc_sinkhorn_iters,
+               hc_eps,
+               norm_eps,
+               y,
+               post,
+               comb_frag,
+               pre);
+
+  return std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>(
+      y, post, comb_frag, pre);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hc_pre_va_impl_npu(
+    const at::Tensor& x,
+    const at::Tensor& hc_fn,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    const c10::optional<at::Tensor>& pre_mix,
+    int64_t hc_mult,
+    int64_t hc_sinkhorn_iters,
+    double norm_eps,
+    double hc_eps) {
+  TORCH_CHECK(x.device().type() == torch_npu::utils::get_npu_device_type(),
+              "x must be on an NPU");
+  check_hc_pre_shape_and_dtype(x, hc_fn, hc_scale, hc_base, pre_mix, hc_mult);
+  TORCH_CHECK(hc_sinkhorn_iters > 0 && std::isfinite(norm_eps) &&
+                  norm_eps > 0 && std::isfinite(hc_eps) && hc_eps > 0,
+              "iterations and finite epsilon values must be positive");
+  for (const at::Tensor& tensor : {x, hc_fn, hc_scale, hc_base}) {
+    TORCH_CHECK(tensor.device() == x.device() && tensor.is_contiguous(),
+                "all inputs must be contiguous on the same NPU");
+  }
+  if (pre_mix.has_value() && pre_mix->defined()) {
+    TORCH_CHECK(pre_mix->device() == x.device() && pre_mix->is_contiguous(),
+                "pre_mix must be contiguous on the same NPU");
+  }
+  return run_hc_pre_fusion(x,
+                           hc_fn,
+                           hc_scale,
+                           hc_base,
+                           pre_mix,
+                           hc_mult,
+                           hc_sinkhorn_iters,
+                           norm_eps,
+                           hc_eps);
+}
+
+}  // namespace xllm_ops_hc_pre_va
+
+namespace xllm_ops {
+constexpr int64_t DIM_0 = 0;
+constexpr int64_t DIM_1 = 1;
+constexpr int64_t DIM_2 = 2;
+constexpr int64_t DIM_3 = 3;
+constexpr int64_t DIM_4 = 4;
+
+constexpr int64_t SMLA_METADATA_SIZE = 1024;
+
+inline at::Tensor GetValidSmlaVaTensor(
+    const c10::optional<at::Tensor> &tensor, const at::Device &device)
+{
+    return tensor.has_value()
+               ? tensor.value()
+               : at::empty({0}, at::TensorOptions().dtype(at::kInt).device(device));
+}
+
+at::Tensor smla_va_metadata(
+    int64_t numHeadsQ, int64_t numHeadsKv, int64_t headDim, const c10::optional<at::Tensor> &cuSeqlensQ,
+    const c10::optional<at::Tensor> &cuSeqlensOriKv, const c10::optional<at::Tensor> &cuSeqlensCmpKv,
+    const c10::optional<at::Tensor> &sequsedQ, const c10::optional<at::Tensor> &sequsedOriKv,
+    const c10::optional<at::Tensor> &sequsedCmpKv, const c10::optional<at::Tensor> &cmpResidualKv,
+    const c10::optional<at::Tensor> &oriTopkLength, const c10::optional<at::Tensor> &cmpTopkLength, int64_t batchSize,
+    int64_t maxSeqlenQ, int64_t maxSeqlenOriKv, int64_t maxSeqlenCmpKv, int64_t oriTopk, int64_t cmpTopk,
+    int64_t cmpRatio, int64_t oriMaskMode, int64_t cmpMaskMode, int64_t oriWinLeft, int64_t oriWinRight,
+    c10::string_view layoutQ, c10::string_view layoutKv, bool hasOriKv, bool hasCmpKv)
+{
+    at::Device outputDevice = at::Device(std::string("npu"));
+    if (cuSeqlensQ.has_value()) {
+        outputDevice = cuSeqlensQ.value().device();
+    } else if (cuSeqlensOriKv.has_value()) {
+        outputDevice = cuSeqlensOriKv.value().device();
+    } else if (cuSeqlensCmpKv.has_value()) {
+        outputDevice = cuSeqlensCmpKv.value().device();
+    } else if (sequsedQ.has_value()) {
+        outputDevice = sequsedQ.value().device();
+    } else if (sequsedOriKv.has_value()) {
+        outputDevice = sequsedOriKv.value().device();
+    } else if (sequsedCmpKv.has_value()) {
+        outputDevice = sequsedCmpKv.value().device();
+    } else if (cmpResidualKv.has_value()) {
+        outputDevice = cmpResidualKv.value().device();
+    } else if (oriTopkLength.has_value()) {
+        outputDevice = oriTopkLength.value().device();
+    } else if (cmpTopkLength.has_value()) {
+        outputDevice = cmpTopkLength.value().device();
+    }
+
+    at::Tensor output = torch::empty({SMLA_METADATA_SIZE}, torch::dtype(torch::kInt32).device(outputDevice));
+    auto cuSeqlensQVal = GetValidSmlaVaTensor(cuSeqlensQ, outputDevice);
+    auto cuSeqlensOriKvVal = GetValidSmlaVaTensor(cuSeqlensOriKv, outputDevice);
+    auto cuSeqlensCmpKvVal = GetValidSmlaVaTensor(cuSeqlensCmpKv, outputDevice);
+    auto sequsedQVal = GetValidSmlaVaTensor(sequsedQ, outputDevice);
+    auto sequsedOriKvVal = GetValidSmlaVaTensor(sequsedOriKv, outputDevice);
+    auto sequsedCmpKvVal = GetValidSmlaVaTensor(sequsedCmpKv, outputDevice);
+    auto cmpResidualKvVal = GetValidSmlaVaTensor(cmpResidualKv, outputDevice);
+    auto oriTopkLengthVal = GetValidSmlaVaTensor(oriTopkLength, outputDevice);
+    auto cmpTopkLengthVal = GetValidSmlaVaTensor(cmpTopkLength, outputDevice);
+
+    // convert str
+    std::string layoutQStr = std::string(layoutQ);
+    std::string layoutKvStr = std::string(layoutKv);
+    char *layoutQPtr = const_cast<char *>(layoutQStr.c_str());
+    char *layoutKvPtr = const_cast<char *>(layoutKvStr.c_str());
+
+    EXEC_NPU_CMD(aclnnSmlaVaMetadata, cuSeqlensQVal, cuSeqlensOriKvVal, cuSeqlensCmpKvVal, sequsedQVal,
+              sequsedOriKvVal, sequsedCmpKvVal, cmpResidualKvVal, oriTopkLengthVal, cmpTopkLengthVal, numHeadsQ,
+              numHeadsKv, headDim, batchSize, maxSeqlenQ, maxSeqlenOriKv, maxSeqlenCmpKv, oriTopk, cmpTopk, cmpRatio,
+              oriMaskMode, cmpMaskMode, oriWinLeft, oriWinRight, layoutQPtr, layoutKvPtr, hasOriKv, hasCmpKv, output);
+    return output;
+}
+
+void CheckQueryShape(const at::Tensor &q, const std::string &layoutQStr)
+{
+    TORCH_CHECK(layoutQStr == "BSND" || layoutQStr == "TND", "The layout of query only support BSND and TND, but got ",
+                layoutQStr);
+    TORCH_CHECK(q.numel() > 0, "Tensor query is empty.");
+    for (int64_t i = 0; i < q.dim(); i++) {
+        TORCH_CHECK(q.size(i) > 0,
+                    "All values within query's shape should be greater "
+                    "than 0, but shape[",
+                    i, "] is ", q.size(i));
+    }
+    if (layoutQStr == "BSND") {
+        TORCH_CHECK(q.dim() == DIM_4, "When the layout of query is BSND, the query dimension must be 4, but got ",
+                    q.dim());
+    } else {
+        TORCH_CHECK(q.dim() == DIM_3, "When the layout of query is TND, the query dimension must be 3, but got ",
+                    q.dim());
+    }
+}
+
+int64_t GetKvHeadNum(const c10::optional<at::Tensor> &oriKv, const c10::optional<at::Tensor> &cmpKv,
+                     const std::string &layoutKvStr)
+{
+    TORCH_CHECK(oriKv.has_value() || cmpKv.has_value(),
+                "ori_kv or cmp_kv is required when return_softmax_lse is true.");
+    const at::Tensor &kv = oriKv.has_value() ? oriKv.value() : cmpKv.value();
+    if (layoutKvStr == "TND") {
+        return kv.size(DIM_1);
+    }
+    return kv.size(DIM_2);
+}
+
+std::tuple<at::Tensor, at::Tensor> MakeSmlaVaOutputs(const at::Tensor &q,
+                                                             const c10::optional<at::Tensor> &oriKv,
+                                                             const c10::optional<at::Tensor> &cmpKv,
+                                                             const std::string &layoutQStr,
+                                                             const std::string &layoutKvStr, bool returnSoftmaxLse)
+{
+    CheckQueryShape(q, layoutQStr);
+    at::Tensor attenOut = at::empty_like(q);
+    at::Tensor softmaxLse;
+    if (!returnSoftmaxLse) {
+        softmaxLse = at::empty({0}, q.options().dtype(torch::kFloat32));
+        return {attenOut, softmaxLse};
+    }
+
+    int64_t kvHeadNum = GetKvHeadNum(oriKv, cmpKv, layoutKvStr);
+    TORCH_CHECK(kvHeadNum > 0, "head num of ori_kv or cmp_kv must be greater than 0, but got ", kvHeadNum);
+    if (layoutQStr == "BSND") {
+        softmaxLse = at::empty({q.size(DIM_0), kvHeadNum, q.size(DIM_1), q.size(DIM_2) / kvHeadNum},
+                               q.options().dtype(torch::kFloat32));
+    } else {
+        softmaxLse =
+            at::empty({kvHeadNum, q.size(DIM_0), q.size(DIM_1) / kvHeadNum}, q.options().dtype(torch::kFloat32));
+    }
+    return {attenOut, softmaxLse};
+}
+
+std::tuple<at::Tensor, at::Tensor> smla_va(
+    const at::Tensor &q, const c10::optional<at::Tensor> &oriKv, const c10::optional<at::Tensor> &cmpKv,
+    const c10::optional<at::Tensor> &oriSparseIndices, const c10::optional<at::Tensor> &cmpSparseIndices,
+    const c10::optional<at::Tensor> &oriBlockTable, const c10::optional<at::Tensor> &cmpBlockTable,
+    const c10::optional<at::Tensor> &cuSeqlensQ, const c10::optional<at::Tensor> &cuSeqlensOriKv,
+    const c10::optional<at::Tensor> &cuSeqlensCmpKv, const c10::optional<at::Tensor> &sequsedQ,
+    const c10::optional<at::Tensor> &sequsedOriKv, const c10::optional<at::Tensor> &sequsedCmpKv,
+    const c10::optional<at::Tensor> &cmpResidualKv, const c10::optional<at::Tensor> &oriTopkLength,
+    const c10::optional<at::Tensor> &cmpTopkLength, const c10::optional<at::Tensor> &sinks,
+    const c10::optional<at::Tensor> &metadata, double softmaxScale, int64_t cmpRatio, int64_t oriMaskMode,
+    int64_t cmpMaskMode, int64_t oriWinLeft, int64_t oriWinRight, c10::string_view layoutQ, c10::string_view layoutKv,
+    int64_t topkValueMode, bool returnSoftmaxLse)
+{
+    std::string layoutQStr = std::string(layoutQ);
+    std::string layoutKvStr = std::string(layoutKv);
+    // convert str
+    char *layoutQPtr = const_cast<char *>(layoutQStr.c_str());
+    char *layoutKvPtr = const_cast<char *>(layoutKvStr.c_str());
+
+    // construct the atten_out tensor
+    std::tuple<at::Tensor, at::Tensor> sparseFlashMlaAttenOut =
+        MakeSmlaVaOutputs(q, oriKv, cmpKv, layoutQStr, layoutKvStr, returnSoftmaxLse);
+    at::Tensor attenOut = std::get<0>(sparseFlashMlaAttenOut);
+    at::Tensor softmaxLse = std::get<1>(sparseFlashMlaAttenOut);
+
+    EXEC_NPU_CMD(aclnnSmlaVa, q, oriKv, cmpKv, oriSparseIndices, cmpSparseIndices, oriBlockTable, cmpBlockTable,
+              cuSeqlensQ, cuSeqlensOriKv, cuSeqlensCmpKv, sequsedQ, sequsedOriKv, sequsedCmpKv, cmpResidualKv,
+              oriTopkLength, cmpTopkLength, sinks, metadata, softmaxScale, cmpRatio, oriMaskMode, cmpMaskMode,
+              oriWinLeft, oriWinRight, layoutQPtr, layoutKvPtr, topkValueMode, returnSoftmaxLse, attenOut, softmaxLse);
+    return std::tuple<at::Tensor, at::Tensor>(attenOut, softmaxLse);
+}
+
+} // namespace xllm_ops
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("select_unshared_kv", &select_unshared_kv_impl_npu, "select_unshared_kv");
   m.def("cache_unshared_kv", &cache_unshared_kv_impl_npu, "cache_unshared_kv");
@@ -2381,4 +2763,34 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("sparse_attn_sharedkv_metadata", &sparse_attn_sharedkv_metadata_impl_npu, "sparse_attn_sharedkv_metadata");
   m.def("quant_lightning_indexer_metadata", &quant_lightning_indexer_metadata_impl_npu, "quant_lightning_indexer_metadata");
   m.def("lightning_indexer_quant_metadata", &lightning_indexer_quant_metadata_impl_npu, "lightning_indexer_quant_metadata");
+}
+
+TORCH_LIBRARY_FRAGMENT(xllm_ops, ops) {
+    ops.def(
+        "smla_va_metadata(int num_heads_q, int num_heads_kv, int head_dim, *, "
+        "Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_ori_kv=None, Tensor? cu_seqlens_cmp_kv=None, "
+        "Tensor? seqused_q=None, Tensor? seqused_ori_kv=None, Tensor? seqused_cmp_kv=None, "
+        "Tensor? cmp_residual_kv=None, Tensor? ori_topk_length=None, Tensor? cmp_topk_length=None, "
+        "int batch_size=0, int max_seqlen_q=0, int max_seqlen_ori_kv=0, int max_seqlen_cmp_kv=0, "
+        "int ori_topk=0, int cmp_topk=0, int cmp_ratio=0, int ori_mask_mode=0, int cmp_mask_mode=0, "
+        "int ori_win_left=-1, int ori_win_right=-1, str layout_q='BSND', str layout_kv='BSND', "
+        "bool has_ori_kv=True, bool has_cmp_kv=True) -> Tensor"
+    );
+    ops.impl("smla_va_metadata", torch::kPrivateUse1,
+             &xllm_ops::smla_va_metadata);
+
+    ops.def(
+        "smla_va(Tensor q, *, Tensor? ori_kv=None, Tensor? cmp_kv=None, "
+        "Tensor? ori_sparse_indices=None, Tensor? cmp_sparse_indices=None, "
+        "Tensor? ori_block_table=None, Tensor? cmp_block_table=None, "
+        "Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_ori_kv=None, Tensor? cu_seqlens_cmp_kv=None, "
+        "Tensor? seqused_q=None, Tensor? seqused_ori_kv=None, Tensor? seqused_cmp_kv=None, "
+        "Tensor? cmp_residual_kv=None, Tensor? ori_topk_length=None, Tensor? cmp_topk_length=None, "
+        "Tensor? sinks=None, Tensor? metadata=None, float softmax_scale=1.0, int cmp_ratio=0, "
+        "int ori_mask_mode=0, int cmp_mask_mode=0, int ori_win_left=-1, int ori_win_right=-1, "
+        "str layout_q='BSND', str layout_kv='BSND', int topk_value_mode=1, "
+        "bool return_softmax_lse=False) -> (Tensor, Tensor)"
+    );
+    ops.impl("smla_va", torch::kPrivateUse1,
+             &xllm_ops::smla_va);
 }
