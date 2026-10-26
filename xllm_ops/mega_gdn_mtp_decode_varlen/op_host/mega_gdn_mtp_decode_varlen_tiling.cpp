@@ -41,7 +41,7 @@ bool has_shape(const gert::Shape& shape, std::initializer_list<int64_t> dims) {
 }
 
 ge::graphStatus tile_varlen(gert::TilingContext* context) {
-  constexpr std::array<ge::DataType, 14> kTypes = {ge::DT_BF16,
+  constexpr std::array<ge::DataType, 13> kTypes = {ge::DT_BF16,
                                                    ge::DT_BF16,
                                                    ge::DT_BF16,
                                                    ge::DT_BF16,
@@ -50,7 +50,6 @@ ge::graphStatus tile_varlen(gert::TilingContext* context) {
                                                    ge::DT_FLOAT,
                                                    ge::DT_FLOAT,
                                                    ge::DT_FLOAT,
-                                                   ge::DT_INT32,
                                                    ge::DT_INT32,
                                                    ge::DT_INT32,
                                                    ge::DT_BF16,
@@ -65,14 +64,15 @@ ge::graphStatus tile_varlen(gert::TilingContext* context) {
   const gert::Shape& qkv = context->GetInputShape(0)->GetStorageShape();
   const gert::Shape& z = context->GetInputShape(1)->GetStorageShape();
   const gert::Shape& conv = context->GetInputShape(5)->GetStorageShape();
-  const gert::Shape& reads = context->GetInputShape(9)->GetStorageShape();
+  const gert::Shape& state_indices =
+      context->GetInputShape(9)->GetStorageShape();
   if (qkv.GetDimNum() != 2 || z.GetDimNum() != 3 || conv.GetDimNum() != 3 ||
-      reads.GetDimNum() != 1) {
+      state_indices.GetDimNum() != 1) {
     return ge::GRAPH_FAILED;
   }
   const int64_t tokens = qkv.GetDim(0);
   const int64_t channels = qkv.GetDim(1);
-  const int64_t batch = reads.GetDim(0);
+  const int64_t batch = state_indices.GetDim(0);
   const int64_t slots = conv.GetDim(0);
   const int64_t stride = conv.GetDim(1) - 2;
   const int64_t nv = z.GetDim(1);
@@ -99,9 +99,8 @@ ge::graphStatus tile_varlen(gert::TilingContext* context) {
       !has_shape(context->GetInputShape(8)->GetStorageShape(),
                  {slots * stride, nv, 128, 128}) ||
       !has_shape(context->GetInputShape(10)->GetStorageShape(), {batch}) ||
-      !has_shape(context->GetInputShape(11)->GetStorageShape(), {batch}) ||
-      !has_shape(context->GetInputShape(12)->GetStorageShape(), {128}) ||
-      !has_shape(context->GetInputShape(13)->GetStorageShape(), {batch + 1})) {
+      !has_shape(context->GetInputShape(11)->GetStorageShape(), {128}) ||
+      !has_shape(context->GetInputShape(12)->GetStorageShape(), {batch + 1})) {
     return ge::GRAPH_FAILED;
   }
   auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());

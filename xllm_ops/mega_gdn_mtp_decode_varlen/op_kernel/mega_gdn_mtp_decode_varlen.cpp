@@ -33,8 +33,7 @@ AICORE PTO_INLINE void run_varlen(
     GM_ADDR a_log,
     GM_ADDR dt_bias,
     GM_ADDR ssm_state,
-    GM_ADDR read_indices,
-    GM_ADDR write_indices,
+    GM_ADDR state_indices,
     GM_ADDR accepted,
     GM_ADDR norm_weight,
     GM_ADDR cu_seqlens,
@@ -53,8 +52,8 @@ AICORE PTO_INLINE void run_varlen(
       reinterpret_cast<__gm__ float*>(a_log),
       reinterpret_cast<__gm__ float*>(dt_bias),
       reinterpret_cast<__gm__ float*>(ssm_state),
-      reinterpret_cast<__gm__ int*>(read_indices),
-      reinterpret_cast<__gm__ int*>(write_indices),
+      reinterpret_cast<__gm__ int*>(state_indices),
+      reinterpret_cast<__gm__ int*>(state_indices),
       reinterpret_cast<__gm__ int*>(accepted),
       reinterpret_cast<__gm__ bfloat16_t*>(norm_weight),
       reinterpret_cast<__gm__ bfloat16_t*>(conv_out),
@@ -78,8 +77,7 @@ extern "C" __global__ __aicore__ void mega_gdn_mtp_decode_varlen(
     GM_ADDR a_log,
     GM_ADDR dt_bias,
     GM_ADDR ssm_state,
-    GM_ADDR read_indices,
-    GM_ADDR write_indices,
+    GM_ADDR state_indices,
     GM_ADDR accepted,
     GM_ADDR norm_weight,
     GM_ADDR cu_seqlens,
@@ -103,8 +101,7 @@ extern "C" __global__ __aicore__ void mega_gdn_mtp_decode_varlen(
                      a_log,          \
                      dt_bias,        \
                      ssm_state,      \
-                     read_indices,   \
-                     write_indices,  \
+                     state_indices,  \
                      accepted,       \
                      norm_weight,    \
                      cu_seqlens,     \

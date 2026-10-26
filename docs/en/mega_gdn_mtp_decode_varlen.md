@@ -15,7 +15,7 @@ Let S be the fixed checkpoint stride (2 through 17), B the request count
 - aLog and dtBias: FP32 [NV].
 - convState / convStateOut: aliased BF16 [N,S+2,C].
 - ssmState / ssmStateOut: aliased FP32 [N*S,NV,D,D].
-- readStateIndices, writeStateIndices, numAcceptedTokens: device INT32 [B].
+- stateIndices, numAcceptedTokens: device INT32 [B].
 - cuSeqLens: device INT32 [B+1], monotonically nondecreasing endpoints.
 - convOut: BF16 [T,C]; out: BF16 [T,NV,D].
 
@@ -24,15 +24,19 @@ Endpoints lie in [0,T]; the initial endpoint may be nonzero, allowing
 multiple request chunks to address one packed input. Zero-length requests
 do not read or modify state. Only referenced packed output rows are written;
 the caller initializes padding rows and may share outputs across disjoint
-chunks. Duplicate live write slots are unsupported.
+chunks. Each live request must own a unique stateIndices slot across all
+chunks. Zero-length requests may share an index because they never access state.
 
 The previous accepted count remains in [1,S], independently of the current
-prefix length. Restore SSM from readSlot*S+accepted-1 and convolution
-history from accepted-1:accepted+2. Write SSM checkpoint writeSlot*S+t
+prefix length. Restore SSM from stateIndices[i]*S+accepted-1 and convolution
+history from accepted-1:accepted+2 in the same slot. Write SSM checkpoint stateIndices[i]*S+t
 for every current token t, convolution history rows 0:2 from the preceding
 accepted history, and current raw QKV into rows 2:2+prefixLength.
-Unwritten cache rows remain unchanged. In-place same-slot updates are
-supported. flaSsmStateLayout=true stores state in [K,V] order; false uses
+Unwritten cache rows remain unchanged. The single index input enforces
+same-slot reads and writes; separate read/write mappings and cross-slot state
+migration are not supported. Batch order may change while each request keeps
+its own slot. No cross-request state snapshot or extra state copy is required.
+flaSsmStateLayout=true stores state in [K,V] order; false uses
 [V,K], matching the original operator.
 
 Lengths and accepted counts are device inputs: changing them during ACL
