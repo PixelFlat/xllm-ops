@@ -1,4 +1,9 @@
+<!-- Copyright 2026 The xLLM Authors. All Rights Reserved.
+SPDX-License-Identifier: Apache-2.0 -->
+
 # MegaGdnMtpDecodeVarlen
+
+English | [简体中文](../zh/mega_gdn_mtp_decode_varlen.md)
 
 Packed-prefix variant of MegaGdnMtpDecode for Ascend A3. It reuses the same
 fused causal convolution, Q/K normalization, gating, FP32 recurrence,
