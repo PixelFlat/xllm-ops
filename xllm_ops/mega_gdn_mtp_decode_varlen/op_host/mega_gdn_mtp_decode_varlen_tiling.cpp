@@ -77,7 +77,7 @@ ge::graphStatus tile_varlen(gert::TilingContext* context) {
   const int64_t stride = conv.GetDim(1) - 2;
   const int64_t nv = z.GetDim(1);
   const int64_t qk_width = channels - nv * 128;
-  if (tokens < 1 || batch < 1 || batch > 32 || slots < 1 || slots > 1024 ||
+  if (tokens < 1 || batch < 1 || batch > 128 || slots < 1 || slots > 1024 ||
       stride < 2 || stride > 17 || nv < 1 || qk_width < 256 ||
       qk_width % 256 != 0) {
     return ge::GRAPH_FAILED;

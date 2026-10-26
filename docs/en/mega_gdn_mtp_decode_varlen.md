@@ -8,7 +8,7 @@ operator and its ABI are unchanged.
 ## Shapes and state contract
 
 Let S be the fixed checkpoint stride (2 through 17), B the request count
-(1 through 32), T the packed graph capacity, D=128, and C=(2*NK+NV)*D.
+(1 through 128), T the packed graph capacity, D=128, and C=(2*NK+NV)*D.
 
 - qkv: BF16 [T,C]; z: BF16 [T,NV,D]; a and b: BF16 [T,NV].
 - convWeight: BF16 [4,C]; normWeight: BF16 [D].
